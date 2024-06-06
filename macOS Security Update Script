@@ -1,0 +1,254 @@
+#!/bin/sh
+
+jamfHelper="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+FILEPATH="/private/var/scripts"
+FILENAME="update.txt"
+FULLPATH="$FILEPATH"/"$FILENAME"
+if [[ -f $FULLPATH ]]; then
+  updateStatus=`cat $FULLPATH | grep "STATUS" | awk '{ print $2 }'`
+  deferralsLeft=`cat $FULLPATH | grep "DEFERRALS_LEFT" | awk '{ print $2 }'`
+  policyRunDate=`cat $FULLPATH | grep "POLICY_LAST_RUN" | awk '{ print $2 }'`
+  numDeferrals=$((deferralsLeft-5))
+  numDeferrals=$((numDeferrals*-1))
+else
+  updateStatus="Updater File Missing. Waiting for EA to Update"
+fi
+today=`date | awk '{ print $3 }'` # current date
+currenttime=`date | awk '{ print $4 }'` # current time
+currenttime=${currenttime//:}
+requestTime=163000 # time to notify of requested update
+pendingTime=170000 # time to force pending update
+
+MSG_UPGRADE_HEADING="Critical macOS Security Updates Available"
+
+# Messages for Status Available
+MSG_UPGRADE_AVAILABLE="Apple has released critical security updates for your machine, and Vox Media IT would like you to install them as soon as possible.
+
+If now is not a good time, you may select \"Wait\" for more options.
+
+If you would like to install them now, please save all of your work and click \"Install Now\". This process should take up to an hour to complete and your computer will reboot automatically.
+
+If you have any questions, please contact #it-support on Slack."
+
+MSG_WAIT_AVAILABLE="You have selected to Wait.
+
+You may either choose to automatically run the updates at the end of the day today (after 5pm) or defer the original update notification for 24 hours. You may defer up to 5 times.
+
+You have deferred this update $numDeferrals time(s).
+
+To run the updates at the end of the day, select \"Install at 5pm\"
+
+To defer the updates for 24 hours, select \"Defer for 24h\""
+
+MSG_UPGRADING="NOTICE: Please save all your work now. Any unsaved work may be lost once the process begins.
+
+macOS Security Updates are being downloaded to your system now. This process may take some time depending on your internet connection speed. Once completed, your system will reboot automatically to begin the installation.
+
+The installation will take up to one hour to complete. Please keep your machine on and plugged into power.
+
+Note: If this window persists for longer than 2 hours, manually restart your computer to apply the update."
+
+MSG_UPGRADE_REQUESTED="Your system will install critical macOS Security Updates after 5 pm. Please save all work before ending your work day and keep your system on and plugged into AC power. If you have a laptop, please keep the system open as well.
+
+Once the process begins, your system will download the installer and reboot to apply the updates.  You will receive a notification when this process begins."
+
+MSG_UPGRADE_PENDING="This process will apply macOS Security Updates to your system. During this time your computer will reboot automatically resulting in loss of unsaved work.
+
+The installation process will take up to one hour to complete on most systems.
+
+To begin the installation, save all work, and click 'Install Now'. If no response is recorded, the installation will begin after the timer ends."
+
+BATT_NOTICE="Your computer is currently operating on battery power. In order to install this macOS update, you must be plugged into AC power.
+
+Please plug your computer in and click 'OK' to check again."
+ERROR_MSG="The macOS Big Sur installer is missing, please contact IT support to assist with the installation."
+LOGO="/Library/Scripts/Vox_logo.png"
+
+# Slack Webhook
+SN=$(ioreg -l | grep IOPlatformSerialNumber | awk '{ print $4 }' | sed -e 's/"//g')
+echo $SN
+HOST=$(hostname)
+MSG="System \`${HOST}\` failed when installing macOS security updates. Serial Number is \`${SN}\`"
+MSGOK="System \`${HOST}\` is installing macOS security updates. Serial Number is \`${SN}\`"
+PAYLOADOK="payload={\"text\": \"$MSGOK\"}"
+PAYLOAD="payload={\"text\": \"$MSG\"}"
+HOOK=https://hooks.slack.com/services/REDACTED
+
+update_available () {
+
+  policy_limiter $updateStatus
+
+  #if [[ -f "/Library/Scripts/Vox_logo.png" ]]; then
+    PROMPT=$("$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_UPGRADE_AVAILABLE" -button1 "Install Now" -button2 "Wait"  -countdown -timeout 3600 -defaultbutton 2)
+    if [[ $PROMPT == "0" ]]; then
+      echo "chose now"
+      sed -i '' "s/STATUS:.*/STATUS: Applied/" "$FULLPATH"
+      begin_update &
+      "$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_UPGRADING"
+    elif [[ $PROMPT == "2" ]]; then
+      echo "chose later"
+      WAIT=$("$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_WAIT_AVAILABLE" -button1 "Install at 5pm" -button2 "Defer for 24h"  -countdown -timeout 3600 -defaultbutton 2)
+      if [[ $WAIT == "0" ]]; then
+        echo "chose after hours"
+        sed -i '' "s/STATUS:.*/STATUS: Requested/" "$FULLPATH"
+        sed -i '' "s/POLICY_LAST_RUN:.*/POLICY_LAST_RUN: $today/" "$FULLPATH"
+        jamf recon
+      elif [[ $WAIT == "2" ]]; then
+        echo "chose defer"
+        deferralsLeft=$((deferralsLeft-1))
+        if (( $deferralsLeft < 0 )); then
+          deferralsLeft=0
+        fi
+        sed -i '' "s/DEFERRALS_LEFT:.*/DEFERRALS_LEFT: $deferralsLeft/" "$FULLPATH"
+      fi
+    else
+     echo "Something went wrong, exiting"
+     exit 1
+    fi
+    sed -i '' "s/POLICY_LAST_RUN:.*/POLICY_LAST_RUN: $today/" "$FULLPATH"
+    exit 0
+  # else
+  #   echo "logo missing, exiting"
+  #   exit 1
+  # fi
+}
+
+
+update_requested () {
+
+  policy_limiter $updateStatus
+
+  PROMPT=$("$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_UPGRADE_REQUESTED" -button1 "OK" -countdown -timeout 1800 -defaultbutton 1)
+  if [[ $PROMPT == "0" ]]; then
+    echo "user clicked ok"
+    sed -i '' "s/STATUS:.*/STATUS: Pending/" "$FULLPATH"
+    jamf recon
+    exit 0
+  else
+   echo "Something went wrong, exiting"
+   exit 1
+  fi
+
+}
+
+update_pending () {
+
+  policy_limiter $updateStatus
+
+  PROMPT=$("$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_UPGRADE_PENDING" -button1 "Install Now" -countdown -timeout 3600 -defaultButton 1)
+  if [[ $PROMPT == "0" ]]; then
+    sed -i '' "s/STATUS:.*/STATUS: Applied/" "$FULLPATH"
+    begin_update &
+    "$jamfHelper" -windowType "utility" -icon "$LOGO" -title "$MSG_UPGRADE_HEADING" -description "$MSG_UPGRADING"
+  else
+   echo "Something went wrong, exiting"
+   exit 1
+  fi
+}
+
+
+# This function checks the zoom process, if the process is higher than 8% it is assumed a zoom call is running and the process pauses for 30 mins
+check_zoom () {
+  zcpu=$(ps aux | grep '[M]acOS.zoom.us' | awk '{ print $3 }')
+  # setting the CPU value to an int
+  zoomcpu=$(printf "%.0f\n" $zcpu)
+  if [[ $zoomcpu -ge 8 ]]; then
+    echo "zoom meeting"
+    sleept="1800"
+    sleep_now
+  else
+    echo "No zoom meeting"
+    sleept="0"
+  fi
+}
+
+# These functions run along side of check_zoom creating a loop to look for the zoom.us cpu utilization.
+sleep_now () {
+  if [[ $sleept != 0 ]]; then
+    echo "Sleeping for ${sleept}"
+    sleep $sleept
+    check_zoom
+  fi
+}
+get_power_status () {
+  sleep 10
+  pwrstat=`pmset -g ps | grep Now | awk '{ print $4, $5 }'`
+  check_power_status
+}
+check_power_status () {
+  # Checks if system is plugged in
+  if [[ $pwrstat == *"AC"* ]]; then
+    echo "Connected to power"
+  else
+    bPROMPT=$("$jamfHelper" -windowType "utility" -icon "$LOGO" -title "Please Plug in your Computer" -description "$BATT_NOTICE" -button1 "OK")
+    if [[ $bPROMPT == "0" ]]; then
+      get_power_status
+    elif [[ $bPROMPT != "0" ]]; then
+      echo "Unable to determine power status, exiting"
+      exit 1
+    fi
+  fi
+}
+
+policy_limiter () {
+
+  echo "today: $today"
+  echo "run date: $policyRunDate"
+
+  param=$1
+
+  case $param in
+    Available)
+      if (( $today == $policyRunDate )); then
+        echo "policy already run today...breaking"
+        exit 0
+      fi
+      ;;
+    Requested)
+      echo "status is requested...checking time"
+      if [[ $((10#$currenttime + 1)) -lt $requestTime ]]; then
+        echo "still before 4:30pm...breaking"
+        exit 0
+      fi
+      ;;
+    Pending)
+      echo "status is pending...run after 5pm daily"
+      if [[ $((10#$currenttime + 1)) -lt $pendingTime ]]; then
+        echo "before 5pm"
+        exit 0
+      fi
+      ;;
+    *)
+      ;;
+  esac
+}
+
+begin_update () {
+  get_power_status &
+  curl -X POST --data-urlencode "$PAYLOADOK" "$HOOK"
+  softwareupdate -iaR
+}
+
+############################# End of Functions #################################
+
+# Main processes
+check_zoom
+case $updateStatus in
+  Available)
+    update_available
+    ;;
+  Requested)
+    update_requested
+    ;;
+  Pending)
+    update_pending
+    ;;
+  Applied)
+    echo "updates have been applied...awaiting verification"
+    exit 0
+    ;;
+  *)
+    echo "other status: $updateStatus"
+    exit 0
+    ;;
+esac
